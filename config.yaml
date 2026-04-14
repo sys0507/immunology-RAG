@@ -1,0 +1,192 @@
+# =============================================================================
+# ImmunoBiology RAG Q&A System — Global Configuration
+# =============================================================================
+# All modules import constants from src/constant.py, which loads this file.
+# Edit here to change model paths, hyperparameters, or retrieval settings.
+
+# ---------------------------------------------------------------------------
+# Data paths (relative to project root)
+# ---------------------------------------------------------------------------
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  train_dir: data/train
+  stopwords_path: data/english_stopwords.txt   # Generated on first run from NLTK
+
+# ---------------------------------------------------------------------------
+# Model paths  (set to HuggingFace model IDs or local absolute paths)
+# ---------------------------------------------------------------------------
+models:
+  # Embedding model: BGE-M3 — multilingual, top MTEB English, dense+sparse output
+  embedding: BAAI/bge-m3
+
+  # Semantic chunking service embedding (lightweight, CPU-friendly)
+  # Pre-downloaded to local path by setup.sh — avoids network call at service startup
+  # If the local path does not exist, SentenceTransformer falls back to HF download
+  # (requires HF_ENDPOINT=https://hf-mirror.com on AutoDL)
+  semantic_chunk_embedding: models/all-MiniLM-L6-v2
+
+  # Reranker: cross-encoder, top BEIR English benchmark
+  # ⚠️ AutoDL: hf.co is blocked — always run train_reranker.py with TRANSFORMERS_OFFLINE=1
+  # so from_pretrained() uses ~/.cache/huggingface/hub/ without any network calls.
+  reranker: BAAI/bge-reranker-v2-m3
+  reranker_finetuned: outputs/models/reranker_finetuned   # path after fine-tuning
+  # reranker_use_finetuned: set to true to load the fine-tuned reranker instead of the base model.
+  # Set to false (default) to use the base BAAI/bge-reranker-v2-m3 from HF cache.
+  # Toggle this after re-training the reranker with hybrid negatives to compare performance.
+  reranker_use_finetuned: false
+
+  # LLM: Qwen3-8B — strong multilingual/English QA, openly accessible (no HF login), vLLM-served
+  # Matches Tesla RAG project's LLM choice; supports enable_thinking mode (kept off for RAG)
+  llm: Qwen/Qwen3-8B
+  # llm_local_path: filesystem path used by LLaMA-Factory (calls from_pretrained() locally).
+  # Must be a real directory, NOT a HF Hub ID — otherwise LLaMA-Factory will try to download
+  # the model (~16 GB) from hf.co (blocked on AutoDL) and fill the disk.
+  # vLLM uses the HF ID above (via --served-model-name); only training uses this path.
+  llm_local_path: models/Qwen3-8B
+  llm_finetuned: outputs/models/llm_finetuned              # path after SFT
+
+  # Evaluation similarity model (English BERTScore)
+  eval_similarity: sentence-transformers/all-mpnet-base-v2
+
+# ---------------------------------------------------------------------------
+# Vector store
+# ---------------------------------------------------------------------------
+vectorstore:
+  backend: chroma          # Options: "chroma" | "faiss"
+  chroma_path: outputs/vectorstore/chroma
+  collection_name: immunology_chunks
+  bm25_path: outputs/vectorstore/bm25_index.pkl
+  faiss_path: outputs/vectorstore/faiss_index    # used only when backend=faiss
+
+# ---------------------------------------------------------------------------
+# Retrieval settings
+# ---------------------------------------------------------------------------
+retrieval:
+  bm25_topk: 10
+  dense_topk: 10
+  rerank_topk: 5
+  # Reciprocal Rank Fusion: score = sum(1 / (k + rank))
+  rrf_k: 60
+  rrf_bm25_weight: 0.5
+  rrf_dense_weight: 0.5
+  # HyDE (Hypothetical Document Embeddings) query expansion
+  hyde_enabled: false
+
+# ---------------------------------------------------------------------------
+# Chunking settings
+# ---------------------------------------------------------------------------
+chunking:
+  # chunk_size: 512 tokens — calibrated for English academic sentences (~30-40 words avg)
+  # Larger than Tesla (256) because English token density is lower than Chinese
+  chunk_size: 512
+  chunk_overlap: 100
+  # Separators for RecursiveCharacterTextSplitter (English priority order)
+  separators:
+    - "\n\n"
+    - "\n"
+    - ". "
+    - " "
+    - ""
+  # Semantic chunking service
+  semantic_service_url: http://localhost:6000/v1/semantic-chunks
+  # group_size: 15 — English paragraphs are longer than Chinese sentences
+  semantic_group_size: 15
+  max_parent_size: 512      # chars; parent docs larger than this are also child-split
+
+# ---------------------------------------------------------------------------
+# MongoDB settings
+# ---------------------------------------------------------------------------
+mongodb:
+  host: localhost
+  port: 27017
+  db_name: immunology_rag
+  collection: chunk_metadata    # stores parent+child docs with metadata
+  max_pool_size: 100
+  connect_timeout_ms: 5000
+  socket_timeout_ms: 3000
+
+# ---------------------------------------------------------------------------
+# LLM inference settings
+# ---------------------------------------------------------------------------
+llm:
+  vllm_base_url: http://localhost:8000/v1
+  max_tokens: 1024
+  temperature: 0.001
+  top_p: 0.95
+  frequency_penalty: 2.0
+  # Multi-turn conversation: number of prior turns kept in context
+  history_window: 5
+  # enable_thinking: false — disable Qwen3/DeepSeek chain-of-thought prefix
+  enable_thinking: false
+
+# ---------------------------------------------------------------------------
+# External training frameworks (subdirectories of project root)
+# ---------------------------------------------------------------------------
+external:
+  llamafactory_dir: LLaMA-Factory        # relative to project root
+  rag_retrieval_dir: RAG-Retrieval       # relative to project root
+
+# ---------------------------------------------------------------------------
+# Training — Reranker fine-tuning
+# ---------------------------------------------------------------------------
+training:
+  reranker:
+    base_model: BAAI/bge-reranker-v2-m3
+    output_dir: outputs/models/reranker_finetuned
+    epochs: 3
+    batch_size: 16
+    learning_rate: 1.0e-4   # v3: higher LR is safe for LoRA (base weights frozen)
+    warmup_ratio: 0.2       # v3: longer warmup stabilises adapter convergence
+    eval_steps: 200         # v3: evaluate every 200 steps to catch overfitting early
+    save_steps: 100
+    fp16: false
+    bf16: true              # A100 supports bf16 natively
+    max_length: 512
+    logging_steps: 10
+    # ── LoRA v3 config (use_lora: true enables PEFT LoRA instead of full fine-tuning) ──
+    # Full fine-tuning (v1, v2) caused catastrophic forgetting — 560M params updated on
+    # 14,741 triplets erased base model's general ranking knowledge.
+    # LoRA freezes all base weights; only ~7M adapter params (~1.3%) are trained.
+    use_lora: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules:
+      - query
+      - key
+      - value
+
+  # LLM Supervised Fine-Tuning (LoRA)
+  llm_sft:
+    base_model: Qwen/Qwen3-8B
+    output_dir: outputs/models/llm_finetuned
+    epochs: 3
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 2.0e-4
+    warmup_ratio: 0.05
+    eval_steps: 50
+    save_steps: 100
+    bf16: true
+    flash_attn: false       # Optional: set true only if VRAM is tight on A100-40GB
+                            # Requires: pip install flash-attn --no-build-isolation
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules:
+      - q_proj
+      - v_proj
+    logging_steps: 10
+    max_seq_length: 4096
+
+# ---------------------------------------------------------------------------
+# Evaluation settings
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_qa_path: data/train/eval_qa.jsonl
+  output_dir: outputs/system_eval
+  # Recall@K values to compute
+  recall_k_values: [1, 3, 5, 10]
+  # Quick online eval sample size
+  quick_eval_n: 20
