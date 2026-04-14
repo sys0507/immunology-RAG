@@ -196,6 +196,42 @@ everywhere, without passing config objects through function calls.
 **Hot-reload in Settings UI:** `pages/04_Settings.py` calls `importlib.reload(const_mod)`
 after saving `config.yaml`, so pipeline parameters update without restarting Streamlit.
 
+### 📥📤 Data Structures & I/O Examples
+
+**`config.yaml` → `constant.py` value resolution:**
+
+```python
+# Input: config.yaml (on disk)
+retrieval:
+  bm25_topk: 10
+  dense_topk: 10
+  rrf_k: 60
+training:
+  reranker:
+    use_lora: true
+    lora_r: 16
+
+# Output: Python module-level variables (after import)
+import src.constant as C
+
+C.bm25_topk          # → 10         (int)
+C.dense_topk         # → 10         (int)
+C.rrf_k              # → 60         (int)
+C.reranker_use_lora  # → True        (bool)
+C.reranker_lora_r    # → 16         (int)
+C.bge_reranker_model_path  # → "/root/autodl-tmp/.../models/bge-reranker-v2-m3"  (str, absolute path)
+```
+
+**Hot-reload example (Settings page):**
+
+```python
+# Before: bm25_topk = 10
+# User changes config.yaml: bm25_topk: 15 and clicks "Apply"
+
+importlib.reload(const_mod)
+print(const_mod.bm25_topk)   # → 15  (updated without restarting Streamlit)
+```
+
 ---
 
 ## 4. PDF Parsing
@@ -260,6 +296,59 @@ If a page contains no extractable text (scanned PDF), the code falls back to
 `pytesseract.image_to_string()` automatically. This requires `tesseract-ocr` to be
 installed on the system (`apt-get install -y tesseract-ocr tesseract-ocr-eng`).
 
+### 📥📤 Data Structures & I/O Examples
+
+**Input:** Raw PDF file
+```
+data/raw/JanewaysImmunobiologyBiology10thEdition.pdf   (2,157 pages, ~170 MB)
+```
+
+**Output per page:** `data/processed/JanewaysImmunobiologyBiology10thEdition/text/0087.json`
+```json
+{
+  "text": "T cells are activated when their T cell receptor (TCR) binds to an MHC-peptide complex on the surface of an antigen-presenting cell (APC). This interaction, combined with co-stimulatory signals from CD28-B7 binding, triggers intracellular signaling cascades...",
+  "page": 87,
+  "chapter": "Chapter 3",
+  "doc_type": "textbook",
+  "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+  "images_info": [
+    {
+      "title": "Figure 3.4",
+      "path": "data/processed/JanewaysImmunobiologyBiology10thEdition/images/fig_3_4.png",
+      "caption": "Figure 3.4 T cell activation requires two signals..."
+    }
+  ]
+}
+```
+
+**`detect_chapter()` input → output:**
+```python
+# Input: list of text blocks on a page
+blocks = [
+  {"text": "CHAPTER 3", "size": 18.0, "bold": True},
+  {"text": "The Development of Lymphocytes", "size": 16.0, "bold": True},
+  {"text": "T cells are activated when...", "size": 11.0, "bold": False}
+]
+
+# Output:
+detect_chapter(blocks)   # → "Chapter 3"
+```
+
+**`handle_image()` filtering decision:**
+```python
+# Image 1: width=42px, height=38px, size=1200 bytes → SKIPPED (below threshold)
+# Image 2: width=450px, height=320px, size=28000 bytes → KEPT, saved to images/
+# Image 3: no caption nearby → saved but images_info caption = ""
+# Image 4: caption "Figure 3.4 T cell activation..." → images_info populated ✅
+```
+
+**OCR fallback:**
+```python
+# Scanned page: fitz extracts "" (empty string)
+# → pytesseract.image_to_string(page_image)
+# → "T cells are activated when their TCR binds..."  (OCR output, may have typos)
+```
+
 ---
 
 ## 5. Semantic Chunking Service
@@ -314,6 +403,44 @@ GET  /health    → {"status": "ok", "model": "...all-MiniLM-L6-v2"}
 POST /v1/semantic-chunks
      Body: {"text": "...", "group_size": 15}
      Response: {"chunks": ["chunk1", "chunk2", ...]}
+```
+
+### 📥📤 Data Structures & I/O Examples
+
+**HTTP request to `/v1/semantic-chunks`:**
+```json
+POST http://localhost:6000/v1/semantic-chunks
+Content-Type: application/json
+
+{
+  "text": "T cells are activated when their T cell receptor (TCR) binds to an MHC-peptide complex on the surface of an antigen-presenting cell (APC). This interaction triggers intracellular signaling cascades.\n\nB cells, in contrast, recognize native antigen directly through the B cell receptor (BCR). They then undergo clonal selection and affinity maturation in germinal centers.\n\nNK cells kill infected cells without prior sensitization. They use a balance of activating and inhibitory receptors.",
+  "group_size": 15
+}
+```
+
+**HTTP response:**
+```json
+{
+  "chunks": [
+    "T cells are activated when their T cell receptor (TCR) binds to an MHC-peptide complex on the surface of an antigen-presenting cell (APC). This interaction triggers intracellular signaling cascades.",
+    "B cells, in contrast, recognize native antigen directly through the B cell receptor (BCR). They then undergo clonal selection and affinity maturation in germinal centers.\n\nNK cells kill infected cells without prior sensitization. They use a balance of activating and inhibitory receptors."
+  ]
+}
+```
+
+Note: paragraphs 2 and 3 were merged (similar cosine similarity in MiniLM vector space), paragraph 1 stayed separate (different topic — T cells vs B/NK cells).
+
+**MiniLM encoding intermediate step:**
+```python
+# Input sentences → 384-dimensional vectors
+"T cells are activated..." → [0.032, -0.156, 0.078, ..., 0.041]   # shape: (384,)
+"B cells recognize..."     → [0.019, -0.143, 0.092, ..., 0.038]   # shape: (384,)
+"NK cells kill..."         → [0.021, -0.139, 0.087, ..., 0.042]   # shape: (384,)
+
+# Cosine similarity matrix
+sim(T_cells, B_cells) = 0.61   # moderately similar (both are lymphocytes)
+sim(B_cells, NK_cells) = 0.79  # highly similar → merged into one chunk
+sim(T_cells, NK_cells) = 0.58  # lower → T cells stays separate
 ```
 
 ---
@@ -397,6 +524,88 @@ def texts_split(page_records) -> List[Document]:
 }
 ```
 
+### 📥📤 Data Structures & I/O Examples
+
+**`texts_split()` input → output:**
+
+```python
+# Input: list of page records from pdf_parser
+page_records = [
+  {
+    "text": "T cells are activated when their T cell receptor (TCR) binds...\n\n"
+            "This interaction triggers intracellular signaling...\n\n"
+            "The transcription factors NF-κB and NFAT drive...",
+    "page": 87,
+    "chapter": "Chapter 3",
+    "doc_type": "textbook",
+    "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+    "images_info": []
+  },
+  # ... more pages
+]
+
+# Output: list of child Document objects (for Chroma + BM25 indexing)
+children = texts_split(page_records)
+# Returns ~8,494 child Documents
+# Each has: doc.page_content (str), doc.metadata (dict)
+```
+
+**MongoDB documents — parent vs child (actual schema with values):**
+
+```json
+// PARENT document (stored but NOT in Chroma/BM25 index)
+{
+  "_id": "ObjectId('65a3f2b8c4d5e6f7a8b9c0d1')",
+  "page_content": "T cells are activated when their T cell receptor (TCR) binds to an MHC-peptide complex on the surface of an antigen-presenting cell (APC). This interaction, combined with co-stimulatory signals from CD28-B7 binding, triggers intracellular signaling cascades that activate transcription factors such as NF-κB and NFAT. These factors drive the expression of cytokines like IL-2, which promotes clonal expansion of the activated T cell.",
+  "metadata": {
+    "chunk_id":    "janeway10e_ch3_p87_000",
+    "unique_id":   "a1b2c3d4e5f6a7b8c9d0e1f2",
+    "parent_id":   null,
+    "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+    "doc_type":    "textbook",
+    "chapter":     "Chapter 3",
+    "page":        87,
+    "is_parent":   true,
+    "images_info": []
+  }
+}
+
+// CHILD document 1 (stored in MongoDB + Chroma + BM25)
+{
+  "_id": "ObjectId('65a3f2b8c4d5e6f7a8b9c0d2')",
+  "page_content": "T cells are activated when their T cell receptor (TCR) binds to an MHC-peptide complex on the surface of an antigen-presenting cell (APC). This interaction, combined with co-stimulatory signals from CD28-B7 binding, triggers intracellular signaling cascades.",
+  "metadata": {
+    "chunk_id":    "janeway10e_ch3_p87_001",
+    "unique_id":   "b2c3d4e5f6a7b8c9d0e1f2a3",
+    "parent_id":   "a1b2c3d4e5f6a7b8c9d0e1f2",  // ← points to parent's unique_id
+    "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+    "doc_type":    "textbook",
+    "chapter":     "Chapter 3",
+    "page":        87,
+    "is_parent":   false,
+    "images_info": []
+  }
+}
+
+// CHILD document 2 (with 100-token overlap with child 1)
+{
+  "page_content": "...co-stimulatory signals from CD28-B7 binding, triggers intracellular signaling cascades that activate transcription factors such as NF-κB and NFAT. These factors drive IL-2 expression and clonal expansion.",
+  "metadata": {
+    "chunk_id": "janeway10e_ch3_p87_002",
+    "unique_id": "c3d4e5f6a7b8c9d0e1f2a3b4",
+    "parent_id": "a1b2c3d4e5f6a7b8c9d0e1f2",  // same parent
+    ...
+  }
+}
+```
+
+**Word counts at each stage:**
+```
+Page text (raw):          ~800 words (full page)
+Semantic parent chunk:    ~200-300 words (2-3 paragraphs merged by topic)
+Child chunk:              ~60-80 words (≤512 tokens)
+```
+
 ---
 
 ## 7. Embedder & Index Building
@@ -456,6 +665,74 @@ if new_docs:
 
 The same `chunk_id` is a deterministic hash of `(source_file, page, sequence_number)`,
 so re-running on the same PDF always produces the same IDs.
+
+### 📥📤 Data Structures & I/O Examples
+
+**`encode_docs()` — batch embedding child chunks:**
+```python
+# Input: list of text strings (child chunk page_content)
+texts = [
+    "T cells are activated when their T cell receptor (TCR) binds...",
+    "NK cells use activating receptors like NKG2D to detect stress ligands...",
+    # ... up to 4,247 child chunks total
+]
+
+# Output: 2D numpy array
+vectors = embedder.encode_docs(texts)
+print(vectors.shape)   # → (4247, 1024)   — 4,247 chunks × 1,024 dimensions
+print(vectors.dtype)   # → float32
+print(vectors[0][:5])  # → [0.032, -0.156, 0.078, 0.041, -0.093]  (first 5 of 1024 dims)
+```
+
+**`encode_query()` — single query encoding:**
+```python
+query = "How do NK cells recognize infected cells?"
+vector = embedder.encode_query(query)
+print(vector.shape)   # → (1024,)
+print(vector[:5])     # → [0.028, -0.148, 0.082, 0.039, -0.087]
+# Note: slightly different values than doc encoding — asymmetric encoding adds instruction token
+```
+
+**BM25 tokenization example:**
+```python
+text = "T cells are activated by MHC-peptide complexes on APCs"
+english_tokenize(text)
+# → ["cells", "activated", "mhc-peptide", "complexes", "apcs"]
+# Removed: "T" (stopword "t"), "are" (stopword), "by" (stopword), "on" (stopword)
+# Lowercased: "T" → "t", "MHC" → "mhc-peptide"
+
+# BM25 score for this doc given query "NK cell activation":
+# score ≈ 0.0   (no shared tokens after stopword removal)
+
+# BM25 score for doc "NK cells are activated via receptor-ligand interactions":
+# → tokens: ["nk", "cells", "activated", "via", "receptor-ligand", "interactions"]
+# → shared: ["activated"]
+# → score ≈ 4.2  (non-zero — ranked higher)
+```
+
+**Chroma collection structure:**
+```python
+# What's stored in ChromaDB per chunk:
+collection.get(include=["documents", "metadatas", "embeddings"])
+# {
+#   "ids":        ["janeway10e_ch3_p87_001", "janeway10e_ch3_p87_002", ...],
+#   "documents":  ["T cells are activated...", "NK cells use activating...", ...],
+#   "metadatas":  [{"page": 87, "chapter": "Chapter 3", ...}, ...],
+#   "embeddings": [[0.032, -0.156, ...], [0.028, -0.148, ...], ...]  # shape: (4247, 1024)
+# }
+print(collection.count())   # → 4247
+```
+
+**Index files on disk:**
+```
+outputs/vectorstore/
+  ├── chroma/              # ~4.4 GB (4,247 chunks × 1,024 float32 = ~17 MB raw, plus Chroma overhead)
+  │   ├── chroma.sqlite3
+  │   └── <uuid>/
+  │       ├── data_level0.bin
+  │       └── header.bin
+  └── bm25_index.pkl       # ~45 MB (compressed inverted index over 4,247 docs)
+```
 
 ---
 
@@ -533,6 +810,69 @@ instead of (or in addition to) the raw query.
 HyDE bridges the vocabulary gap between short queries and longer document passages —
 the expanded text uses academic vocabulary that matches the textbook's writing style.
 
+### 📥📤 Data Structures & I/O Examples
+
+**BM25 retrieval — input/output:**
+```python
+query = "What cytokines do Th2 cells secrete?"
+
+# BM25 tokenizes query: ["cytokines", "th2", "cells", "secrete"]
+# Scores 4,247 docs, returns top-10
+
+bm25_results = bm25_retriever.retrieve_topk(query, topk=10)
+# Returns: list of Document objects, ordered by BM25 score (highest first)
+# Example:
+print(bm25_results[0].page_content[:80])
+# → "Th2 cells produce the cytokines IL-4, IL-5, and IL-13. IL-4 is critical for..."
+print(bm25_results[0].metadata["page"])   # → 284
+print(bm25_results[0].metadata["chapter"])  # → "Chapter 9"
+```
+
+**Dense (Chroma) retrieval — input/output:**
+```python
+# Query is encoded to 1024-dim vector, then ANN search in Chroma
+dense_results = chroma_retriever.retrieve_topk(query, topk=10)
+# Finds semantically similar chunks even if they don't use the word "cytokines"
+print(dense_results[0].page_content[:80])
+# → "The differentiation of CD4+ T cells into Th2 effectors requires IL-4 signaling..."
+# Note: "secrete" not in text, but semantically relevant ✅
+```
+
+**RRF fusion — step-by-step calculation:**
+```python
+# BM25 results ranking:    doc_A=rank1, doc_B=rank2, doc_C=rank3, doc_D=rank4 ...
+# Dense results ranking:   doc_C=rank1, doc_A=rank2, doc_E=rank3, doc_B=rank4 ...
+
+# RRF formula: score(doc) = Σ weight × (1 / (k + rank))
+# With k=60, bm25_w=0.5, dense_w=0.5:
+
+# doc_A: 0.5 × (1/61) + 0.5 × (1/62) = 0.00820 + 0.00806 = 0.01626
+# doc_C: 0.5 × (1/63) + 0.5 × (1/61) = 0.00794 + 0.00820 = 0.01614
+# doc_B: 0.5 × (1/62) + 0.5 × (1/64) = 0.00806 + 0.00781 = 0.01587
+# doc_E: 0.5 × 0      + 0.5 × (1/63) = 0       + 0.00794 = 0.00794
+# (doc_E not in BM25 top-10, so BM25 contribution = 0)
+
+# Final ranking: doc_A(0.01626) > doc_C(0.01614) > doc_B(0.01587) > doc_E(0.00794)
+
+fused_results = rrf_fuse(bm25_results, dense_results, k=60)
+# Returns: list of (unique_id, score) tuples, sorted descending by score
+# → [("uid_A", 0.01626), ("uid_C", 0.01614), ("uid_B", 0.01587), ...]
+```
+
+**HyDE expansion example:**
+```python
+# Input query (short, conversational):
+query = "how do NK cells kill infected cells?"
+
+# HyDE generates a hypothetical textbook passage:
+hypothetical = "NK cells eliminate virus-infected and tumor cells through a mechanism..."
+# + ~100 more words of academic immunology prose
+
+# Dense search is then run on the hypothetical passage instead of the raw query:
+dense_results = chroma.retrieve_topk(hypothetical, topk=10)
+# The expanded passage matches textbook vocabulary more closely → better recall
+```
+
 ---
 
 ## 9. Reranker
@@ -581,6 +921,74 @@ not all documents.
 batch of 10-20 pairs can hold 100–400 MB on CUDA. The explicit `del inputs;
 torch.cuda.empty_cache()` after scoring is required to prevent OOM during `evaluate.py`
 (which runs the reranker repeatedly while vLLM is also occupying ~34.6 GB of the same GPU).
+
+### 📥📤 Data Structures & I/O Examples
+
+**`rank()` — full input/output walkthrough:**
+
+```python
+query = "What cytokines do Th2 cells secrete?"
+
+# Input: query (str) + list of parent Documents after merge_docs()
+candidate_docs = [
+    Document(page_content="Th2 cells produce IL-4, IL-5, and IL-13. IL-4 is critical...", metadata={...}),
+    Document(page_content="T helper cells differentiate into subsets depending on cytokine...", metadata={...}),
+    Document(page_content="NK cells use activating receptors to detect stress ligands...", metadata={...}),
+    Document(page_content="B cell class switching to IgE is driven by IL-4 and IL-13...", metadata={...}),
+    Document(page_content="Th1 cells secrete IFN-γ and TNF-α, driving macrophage activation...", metadata={...}),
+    # ... up to 20 candidates
+]
+
+# Internally: builds (query, doc) pairs for cross-encoder
+pairs = [
+    ("What cytokines do Th2 cells secrete?", "Th2 cells produce IL-4, IL-5, and IL-13..."),
+    ("What cytokines do Th2 cells secrete?", "T helper cells differentiate into subsets..."),
+    ("What cytokines do Th2 cells secrete?", "NK cells use activating receptors..."),
+    # ...
+]
+# Tokenized to: [CLS] query [SEP] document [SEP]  (max_length=4096)
+
+# Model outputs logit scores (raw, before sigmoid):
+scores = [ 8.34, 4.12, -2.87, 6.91, 1.23, ... ]
+#          ↑ high relevance  ↑ moderate  ↑ irrelevant
+
+# After sorting + top_k=5:
+reranked = [
+    Document("Th2 cells produce IL-4, IL-5, and IL-13...", score=8.34),   # rank 1 ✅
+    Document("B cell class switching... IL-4 and IL-13...", score=6.91),  # rank 2 ✅
+    Document("T helper cells differentiate...", score=4.12),              # rank 3
+    Document("Th1 cells secrete IFN-γ...", score=1.23),                   # rank 4
+    Document("CD4+ effector T cells...", score=0.88),                     # rank 5
+]
+# NK cells doc (score=-2.87) is dropped — irrelevant ✅
+```
+
+**GPU memory management:**
+```python
+# Before del inputs:
+# CUDA memory: ~34.6 GB (vLLM) + ~0.4 GB (reranker batch) = ~35 GB used
+# Free VRAM: ~5 GB
+
+# After del inputs; torch.cuda.empty_cache():
+# CUDA memory: ~34.6 GB (vLLM) + ~0.1 GB (reranker model weights only)
+# Free VRAM: ~5.3 GB  ← safe for next query
+```
+
+**LoRA vs base model loading detection:**
+```python
+model_path = Path("outputs/models/reranker_finetuned/best/")
+
+# Case 1: LoRA adapter (v3/v4)
+(model_path / "adapter_config.json").exists()  # → True
+# → loads base BAAI/bge-reranker-v2-m3, then wraps with PeftModel
+
+# Case 2: Full fine-tuned model (v1/v2)
+(model_path / "adapter_config.json").exists()  # → False
+# → loads directly with AutoModelForSequenceClassification.from_pretrained()
+
+# Case 3: reranker_use_finetuned=False in config.yaml
+# → loads base model from constant.bge_reranker_model_path regardless
+```
 
 ---
 
@@ -651,6 +1059,74 @@ will match more documents.
 
 Used only during `build_train_data.py`. Higher temperature (0.85) for diverse QA
 generation, retry logic with exponential backoff for failed API calls.
+
+### 📥📤 Data Structures & I/O Examples
+
+**Full `generate()` call — input messages list:**
+```python
+# After format_context(reranked_docs) produces:
+context = """[1] Th2 cells produce IL-4, IL-5, and IL-13. IL-4 is critical for B cell class switching to IgE and for driving further Th2 differentiation. IL-5 promotes eosinophil development and activation. IL-13 is important in mucosal immunity and contributes to airway hyperreactivity. (p. 284, Chapter 9)
+
+[2] B cell class switching to IgE is driven by IL-4 and IL-13 produced by Th2 cells in the presence of CD40L-CD40 interactions. This underlies the IgE-mediated allergic response. (p. 291, Chapter 9)
+
+[3] T helper cell differentiation is driven by the cytokine environment during antigen presentation. Th2 differentiation requires IL-4 signaling through STAT6 and the transcription factor GATA3. (p. 280, Chapter 9)"""
+
+# messages list sent to vLLM:
+messages = [
+    {
+        "role": "system",
+        "content": "You are an expert immunology assistant with deep knowledge of immunological principles..."
+    },
+    {   # optional: previous turn (if multi-turn conversation)
+        "role": "user",
+        "content": "What are T helper cell subsets?"
+    },
+    {
+        "role": "assistant",
+        "content": "T helper cells differentiate into distinct subsets including Th1, Th2, Th17..."
+    },
+    {   # current query
+        "role": "user",
+        "content": "Context:\n[1] Th2 cells produce IL-4, IL-5...\n\nQuestion: What cytokines do Th2 cells secrete?"
+    }
+]
+```
+
+**vLLM API response:**
+```python
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-8B",
+    messages=messages,
+    max_tokens=1024,
+    temperature=0.001,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+)
+
+# response.choices[0].message.content:
+answer = "Th2 cells secrete three primary cytokines: IL-4, IL-5, and IL-13 [1]. IL-4 plays a dual role in promoting B cell class switching to IgE and driving further Th2 differentiation [1][2]. IL-5 is responsible for eosinophil development and activation [1]. IL-13 contributes to mucosal immunity and airway hyperreactivity [1]. The differentiation of CD4+ T cells into Th2 effectors is initiated by IL-4 signaling through STAT6 and the transcription factor GATA3 [3]."
+
+# Note: citations [1][2][3] map to the numbered passages in context
+# Note: no <think>...</think> prefix because enable_thinking=False ✅
+```
+
+**Token counts (typical query):**
+```
+System prompt:     ~120 tokens
+Chat history:      0-200 tokens (2 previous turns × ~100 tokens each)
+Context passages:  ~600-900 tokens (5 parent chunks × ~120-180 words each)
+Question:          ~15-25 tokens
+Total input:       ~750-1250 tokens   (well under 8,192 context limit)
+Generated answer:  ~150-300 tokens
+```
+
+**HyDE client difference:**
+```python
+# HyDE prompt (temperature=0.3 for vocabulary variety):
+hyde_prompt = "Generate a detailed immunology textbook passage that would directly answer:\n'What cytokines do Th2 cells secrete?'\n\nWrite in the style of Janeway's Immunobiology. ~100 words."
+
+# HyDE output (used as search query, NOT shown to user):
+hypothetical = "Th2 cells, also known as type 2 helper T cells, are characterized by their production of IL-4, IL-5, IL-10, and IL-13. These cytokines collectively promote humoral immunity, eosinophil activation, and IgE class switching. IL-4 is the signature cytokine that initiates Th2 differentiation through STAT6..."
+```
 
 ---
 
@@ -729,6 +1205,79 @@ def _update_history(self, query: str, answer: str):
 Each turn is appended to the `messages` list sent to vLLM, so the LLM can refer to
 previous answers ("As I mentioned earlier about NK cells...").
 
+### 📥📤 Data Structures & I/O Examples
+
+**`RAGPipeline.answer()` — full input/output:**
+
+```python
+# Input
+pipeline = RAGPipeline()
+result = pipeline.answer(
+    query="What cytokines do Th2 cells secrete?",
+    doc_type=None,        # no filter: search all doc types
+    source_file=None      # no filter: search all PDFs
+)
+
+# Output dict (full structure):
+{
+  "answer": "Th2 cells secrete three primary cytokines: IL-4, IL-5, and IL-13 [1]. IL-4 plays a dual role in promoting B cell class switching to IgE and driving further Th2 differentiation [1][2]...",
+
+  "cite_pages": [284, 291, 280],          # page numbers for [1], [2], [3]
+  "cite_sources": [
+    "JanewaysImmunobiologyBiology10thEdition.pdf",
+    "JanewaysImmunobiologyBiology10thEdition.pdf",
+    "JanewaysImmunobiologyBiology10thEdition.pdf"
+  ],
+  "cite_chapters": ["Chapter 9", "Chapter 9", "Chapter 9"],
+
+  "related_images": [
+    {
+      "title": "Figure 9.3",
+      "path": "data/processed/JanewaysImmunobiologyBiology10thEdition/images/fig_9_3.png",
+      "caption": "Figure 9.3 The differentiation of CD4 T cells into Th1 and Th2 effector cells..."
+    }
+  ],
+
+  "latency_ms": {
+    "hyde":      0,       # HyDE disabled
+    "retrieval": 48,      # BM25 + Chroma search combined
+    "merge":     12,      # MongoDB parent lookup
+    "rerank":    318,     # cross-encoder scoring
+    "llm":       1854     # vLLM generation time
+  },
+
+  "retrieved_docs": [
+    Document(
+      page_content="Th2 cells produce IL-4, IL-5, and IL-13...",
+      metadata={
+        "chunk_id": "janeway10e_ch9_p284_003",
+        "unique_id": "a1b2c3d4...",
+        "parent_id": null,
+        "page": 284, "chapter": "Chapter 9",
+        "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+        "is_parent": true
+      }
+    ),
+    # ... 4 more Documents (top-5 after reranking)
+  ]
+}
+```
+
+**Intermediate data at each pipeline step:**
+```python
+# After BM25: 10 child chunks, scored
+# After dense: 10 child chunks, scored (some overlap with BM25)
+# After RRF: up to 20 unique child chunks with combined scores
+
+# After merge_docs(): all child chunks → replaced with their parent chunks
+# child (60 words) → parent (200 words) via MongoDB lookup
+# Example: "...TCR binds to MHC..." (child) → "T cells are activated when TCR binds...
+#           triggers NF-κB and NFAT... drives IL-2 expression..." (parent)
+
+# After reranker: top 5 parent chunks (from 20 candidates)
+# After format_context(): numbered string passed to LLM
+```
+
 ---
 
 ## 12. Utilities
@@ -788,6 +1337,73 @@ print(tracker.get_all())
 ```
 
 The Streamlit Q&A page renders these as an animated bar chart under each answer.
+
+### 📥📤 Data Structures & I/O Examples
+
+**`merge_docs()` — before vs after parent resolution:**
+```python
+# Input: fused child chunks from RRF
+input_docs = [
+    Document(
+        page_content="TCR binds MHC-peptide complex on APC surface.",  # 60 words
+        metadata={"unique_id": "b2c3d4", "parent_id": "a1b2c3", "page": 87}
+    ),
+    Document(
+        page_content="IL-4 promotes class switching to IgE.",           # 55 words
+        metadata={"unique_id": "c3d4e5", "parent_id": "d4e5f6", "page": 291}
+    ),
+    # 18 more child chunks...
+]
+
+# MongoDB lookup for parent_id "a1b2c3":
+parent_doc = Document(
+    page_content="T cells are activated when their TCR binds to an MHC-peptide complex on the surface of an APC. This interaction triggers intracellular signaling cascades that activate NF-κB and NFAT. These factors drive IL-2 expression and clonal expansion.",  # 200 words
+    metadata={"unique_id": "a1b2c3", "parent_id": None, "is_parent": True, "page": 87}
+)
+
+# Output: list of parent Documents (deduplicated by unique_id)
+merged = merge_docs(input_docs, [])
+# len(merged) <= len(input_docs)  (dedup removes siblings sharing same parent)
+# merged[0].page_content → the 200-word parent text (not the 60-word child)
+```
+
+**`post_processing()` — citation extraction:**
+```python
+# Input:
+answer = "Th2 cells secrete IL-4 and IL-5 [1]. IL-4 drives IgE switching [1][2]. Multiple mechanisms are involved [2,3]."
+docs = [parent_doc_1, parent_doc_2, parent_doc_3, parent_doc_4, parent_doc_5]
+
+# Regex matches: ["1", "1", "2", "2,3"] → unique indices: {1, 2, 3}
+# Output:
+post_processing(answer, docs)
+# {
+#   "answer": "Th2 cells secrete IL-4 and IL-5 [1]...",
+#   "cite_pages":   [284, 291, 280],     # docs[0].metadata["page"], docs[1], docs[2]
+#   "cite_sources": ["Janeway10e.pdf", "Janeway10e.pdf", "Janeway10e.pdf"],
+#   "related_images": [{"title": "Figure 9.3", "path": "..."}]  # from docs[0] images_info
+# }
+```
+
+**`LatencyTracker` — timing example:**
+```python
+tracker = LatencyTracker()
+
+tracker.start("retrieval")
+# ... BM25 + Chroma search (~48 ms)
+tracker.stop("retrieval")
+
+tracker.start("rerank")
+# ... cross-encoder on 20 docs (~318 ms)
+tracker.stop("rerank")
+
+tracker.start("llm")
+# ... vLLM generation (~1854 ms)
+tracker.stop("llm")
+
+tracker.get_all()
+# → {"retrieval": 48.3, "rerank": 318.7, "llm": 1854.2}  # all in milliseconds
+# Streamlit renders this as a horizontal stacked bar chart
+```
 
 ---
 
@@ -1078,6 +1694,91 @@ A held-out evaluation set for benchmarking the full RAG system after fine-tuning
 | `reranker_test.jsonl` | 2,195 | 7.5 MB | Same as train | Eval metrics during training |
 | `sft_train.jsonl` | 16,936 | 37 MB | ShareGPT `{messages: [...]}` | LLaMA-Factory SFT trainer |
 | `eval_qa.jsonl` | 116 | < 1 MB | `{question, answer, metadata}` | `evaluate.py` end-to-end eval |
+
+### 📥📤 Data Structures & I/O Examples
+
+**Stage 1 — QA generation, actual vLLM request/response:**
+
+```python
+# Prompt sent to vLLM (CONTEXT_PROMPT_TPL filled in):
+prompt = """You are an expert immunology educator. Given the following passage from an immunology textbook, generate 5 distinct question-answer pairs...
+
+Passage:
+NK cells use a balance of activating and inhibitory receptors to distinguish infected or tumor cells from healthy cells. Activating receptors such as NKG2D bind to stress ligands (MICA, MICB, ULBP) that are upregulated on infected cells but absent on healthy cells. Inhibitory receptors, particularly KIR receptors, recognize MHC class I molecules. Healthy cells express normal levels of MHC class I and thus inhibit NK cell killing.
+
+Output ONLY a JSON array..."""
+
+# vLLM raw response:
+raw = '[{"question": "What is the role of NKG2D in NK cell activation?", "answer": "NKG2D is an activating receptor on NK cells that binds stress ligands such as MICA and MICB, which are upregulated on infected or tumor cells, triggering NK cell cytotoxicity."}, ...]'
+
+# After JSON parse + one record saved to qa_pairs_cache.jsonl:
+{
+  "question": "What is the role of NKG2D in NK cell activation?",
+  "answer": "NKG2D is an activating receptor on NK cells that binds stress ligands such as MICA and MICB, which are upregulated on infected or tumor cells, triggering NK cell cytotoxicity.",
+  "passage": "NK cells use a balance of activating and inhibitory receptors...",
+  "chunk_id": "janeway10e_ch3_p112_004",
+  "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+  "chapter": "Chapter 3",
+  "page": "112",
+  "unique_id": "f7a8b9c0d1e2f3a4b5c6d7e8"
+}
+```
+
+**Stage 2 — triplet with parent resolution (v4):**
+```python
+# qa["unique_id"] = "f7a8b9c0d1e2f3a4b5c6d7e8"  (child chunk)
+# Child chunk text: "NK cells use a balance..." (~65 words)
+# Child's parent_id: "e6f7a8b9c0d1e2f3a4b5c6d7"
+
+# _resolve_parent_content("f7a8b9c0d1e2f3a4b5c6d7e8", uid_to_chunk):
+# → finds child → finds parent via parent_id
+# → returns parent page_content: "NK cells are innate immune lymphocytes that can kill..." (~230 words)
+
+# Hard negative: hybrid retrieval returns "KIR gene polymorphism creates individual variation..."
+# Negative uid: "a9b0c1d2e3f4a5b6c7d8e9f0"  (also a child, resolved to its parent)
+# → _resolve_parent_content("a9b0c1d2e3f4a5b6c7d8e9f0", uid_to_chunk) → parent (~220 words)
+
+# Written to reranker_train.jsonl:
+{
+  "query":     "What is the role of NKG2D in NK cell activation?",
+  "pos":       "NK cells are innate immune lymphocytes that can kill virus-infected and tumor cells without prior sensitization. They express activating receptors such as NKG2D that bind to stress ligands MICA, MICB, and ULBP proteins upregulated on infected cells...",
+  "neg":       "The KIR gene locus shows remarkable polymorphism between individuals, creating variation in the inhibitory and activating receptor repertoire. Some individuals have predominantly inhibitory KIR haplotypes while others have activating haplotypes...",
+  "pos_label": 2,
+  "neg_label": 0
+}
+```
+
+**Stage 3 — SFT record (ShareGPT format for LLaMA-Factory):**
+```json
+{
+  "messages": [
+    {
+      "from": "system",
+      "value": "You are an expert immunology assistant. Answer questions accurately using the provided context. Cite relevant information and use proper immunological terminology."
+    },
+    {
+      "from": "human",
+      "value": "Context:\nNK cells use a balance of activating and inhibitory receptors to distinguish infected or tumor cells from healthy cells. Activating receptors such as NKG2D bind to stress ligands (MICA, MICB, ULBP) that are upregulated on infected cells but absent on healthy cells...\n\nQuestion: What is the role of NKG2D in NK cell activation?"
+    },
+    {
+      "from": "gpt",
+      "value": "NKG2D is an activating receptor on NK cells that binds stress ligands such as MICA and MICB, which are upregulated on infected or tumor cells, triggering NK cell cytotoxicity."
+    }
+  ]
+}
+```
+
+**Stage 4 — eval_qa record (no passage field):**
+```json
+{
+  "question": "What is the role of NKG2D in NK cell activation?",
+  "answer":   "NKG2D is an activating receptor on NK cells that binds stress ligands such as MICA and MICB, which are upregulated on infected or tumor cells, triggering NK cell cytotoxicity.",
+  "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+  "chapter":     "Chapter 3",
+  "page":        "112",
+  "unique_id":   "f7a8b9c0d1e2f3a4b5c6d7e8"
+}
+```
 
 ---
 
@@ -1370,6 +2071,72 @@ Adapter size:       ~30–50 MB vs ~1.1 GB (full model)  → easy to version-con
 Training time:      ~2 h (117 min for v3; LoRA trains faster than full FT per step)
 ```
 
+### 📥📤 Data Structures & I/O Examples
+
+**Training DataLoader — one batch:**
+```python
+# DataCollator processes one batch of 16 triplets:
+# For each triplet: 2 pairs → (query, pos) and (query, neg)
+# Batch of 16 triplets → 32 encoded pairs
+
+# Tokenized batch:
+encoded = {
+  "input_ids":      tensor of shape (32, 512),   # dtype=torch.long
+  "attention_mask": tensor of shape (32, 512),   # dtype=torch.long
+  "token_type_ids": tensor of shape (32, 512)    # if model uses them
+}
+labels = tensor([1, 0, 1, 0, 1, 0, ...])   # shape: (32,)  alternating pos/neg
+
+# Forward pass:
+logits = model(**encoded).logits.squeeze(-1)   # shape: (32,)
+# Example values:
+logits = tensor([ 8.34, -3.12,  6.91, -1.87,  7.23, -2.45, ...])
+#                  pos    neg    pos    neg    pos    neg
+
+# Loss (BCEWithLogitsLoss, cast to float32):
+loss = BCEWithLogitsLoss()(logits.float(), labels.float())
+# Step 1 loss: ~0.8074
+# Step 100 (with real negatives): ~0.3200  (still decreasing ✅)
+# Step 100 (with LLM-generated negatives): ~0.0015  (collapsed ❌)
+```
+
+**Training progress output (actual from v3 run):**
+```
+Epoch 1/3 [Step 50/1640]:   loss=0.8074  NDCG@10=0.8828
+Epoch 1/3 [Step 100/1640]:  loss=0.6312  NDCG@10=0.9103
+Epoch 1/3 [Step 200/1640]:  loss=0.4891  NDCG@10=0.9341
+Epoch 2/3 [Step 500/1640]:  loss=0.3104  NDCG@10=0.9487
+Epoch 3/3 [Step 1640/1640]: loss=0.2201  NDCG@10=0.9554
+Training complete. Best checkpoint at step 1500 (NDCG@10=0.9554)
+```
+
+**Saved adapter files (LoRA checkpoint):**
+```
+outputs/models/reranker_finetuned/best/
+  ├── adapter_config.json          # ~1 KB
+  │   {
+  │     "peft_type": "LORA",
+  │     "task_type": "SEQ_CLS",
+  │     "base_model_name_or_path": "/root/.../models/bge-reranker-v2-m3",
+  │     "r": 16,
+  │     "lora_alpha": 32,
+  │     "lora_dropout": 0.05,
+  │     "target_modules": ["query", "key", "value"],
+  │     "bias": "none"
+  │   }
+  ├── adapter_model.safetensors    # ~40 MB (only LoRA A/B matrices)
+  └── training_complete.json       # sentinel: {"completed": true, "step": 1500, ...}
+```
+
+**compare_pre_post() output:**
+```
+=== Reranker Comparison ===
+Base model:         Recall@1=0.559  MRR@10=0.613
+Fine-tuned (v3):    Recall@1=0.360  MRR@10=0.332  ← REGRESSED
+Delta:              Recall@1=-0.199  MRR@10=-0.281
+→ Base model still active (reranker_use_finetuned: false in config.yaml)
+```
+
 ---
 
 ## 15. Fine-Tuning: LLM SFT (LoRA)
@@ -1447,6 +2214,90 @@ outputs/models/llm_finetuned/checkpoint-150/
 This is **NOT** a complete model. vLLM needs a full model directory. The merge step
 (`llamafactory-cli export`) produces a complete, standalone model by applying
 `W_effective = W_original + BA` for every LoRA-modified layer.
+
+### 📥📤 Data Structures & I/O Examples
+
+**Auto-generated LLaMA-Factory YAML config:**
+```yaml
+# Written to LLaMA-Factory/immunology_sft_config.yaml by build_llamafactory_config()
+model_name_or_path: /root/autodl-tmp/Immunology_RAG/models/Qwen3-8B
+do_train: true
+finetuning_type: lora
+template: qwen
+dataset: immunology_sft
+dataset_dir: /root/autodl-tmp/Immunology_RAG/data/train
+output_dir: /root/autodl-tmp/Immunology_RAG/outputs/models/llm_finetuned
+logging_steps: 10
+save_steps: 500
+eval_strategy: "no"
+num_train_epochs: 3
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - v_proj
+```
+
+**LLaMA-Factory training progress (6,351 steps over ~4.6 h):**
+```
+[2026-04-01 08:15] Step  100/6351: loss=2.3142  lr=1.8e-05
+[2026-04-01 09:22] Step  500/6351: loss=1.4871  lr=1.6e-05
+[2026-04-01 10:45] Step 1000/6351: loss=1.1203  lr=1.3e-05
+[2026-04-01 11:58] Step 2000/6351: loss=0.9341  lr=8.5e-06
+[2026-04-01 12:47] Step 3000/6351: loss=0.8102  lr=4.8e-06
+[2026-04-01 13:22] Step 4000/6351: loss=0.7654  lr=2.1e-06
+[2026-04-01 13:44] Step 5000/6351: loss=0.7234  lr=5.4e-07
+[2026-04-01 13:56] Step 6351/6351: loss=0.7089
+Training complete. Total: 274 min (4.57 h)
+```
+
+**LoRA adapter checkpoint structure:**
+```
+outputs/models/llm_finetuned/checkpoint-6351/
+  ├── adapter_config.json          # LoRA config (base model path, r=16, α=32)
+  ├── adapter_model.safetensors    # ~200 MB (q_proj + v_proj for all 32 layers)
+  ├── tokenizer_config.json
+  └── special_tokens_map.json
+```
+
+**LoRA math — parameter count:**
+```python
+# Qwen3-8B architecture:
+# - 32 transformer layers
+# - Hidden dimension d = 4096
+# - q_proj: (4096, 4096)
+# - v_proj: (4096, 4096)
+
+# LoRA matrices per projection per layer:
+# A: (4096, 16)  = 65,536 parameters
+# B: (16, 4096)  = 65,536 parameters
+# Per projection: 131,072 parameters
+
+# Total LoRA parameters:
+32 layers × 2 projections × 131,072 = 8,388,608 ≈ 8M trainable params
+# vs 8,000,000,000 total params in Qwen3-8B
+# → 0.10% of parameters trained
+```
+
+**Post-merge model structure (vLLM-compatible):**
+```
+outputs/models/llm_finetuned_merged/
+  ├── config.json                  # standard Qwen3 config
+  ├── model-00001-of-00004.safetensors   # ~4 GB each
+  ├── model-00002-of-00004.safetensors
+  ├── model-00003-of-00004.safetensors
+  ├── model-00004-of-00004.safetensors
+  ├── tokenizer.json
+  └── tokenizer_config.json
+# Total: ~16 GB (same size as base — LoRA weights merged into W_effective)
+```
 
 ---
 
@@ -1609,6 +2460,114 @@ Six matplotlib charts are saved to `outputs/system_eval/`:
 
 All charts are embedded as base64 in `evaluation_report.html` for a self-contained report.
 
+### 📥📤 Data Structures & I/O Examples
+
+**eval_qa.jsonl — one input record:**
+```json
+{
+  "question": "What is the role of NKG2D in NK cell activation?",
+  "answer": "NKG2D is an activating receptor on NK cells that binds stress ligands such as MICA and MICB, which are upregulated on infected or tumor cells, triggering NK cell cytotoxicity.",
+  "source_file": "JanewaysImmunobiologyBiology10thEdition.pdf",
+  "chapter": "Chapter 3",
+  "page": "112",
+  "unique_id": "f7a8b9c0d1e2f3a4b5c6d7e8"
+}
+```
+
+**Per-sample evaluation output:**
+```python
+# For the query above:
+result = pipeline.answer("What is the role of NKG2D in NK cell activation?")
+
+# Ground truth unique_id: "f7a8b9c0d1e2f3a4b5c6d7e8"
+# Retrieved doc unique_ids (after reranking, top-5):
+retrieved_ids = [
+    "e6f7a8b9...",   # parent of the gold chunk ← this one matches!
+    "d5e6f7a8...",
+    "c4d5e6f7...",
+    "b3c4d5e6...",
+    "a2b3c4d5..."
+]
+
+# Recall@1: gold found at rank 1? → parent_id of gold == retrieved_ids[0]? → YES
+# Recall@1 for this sample: 1.0
+# MRR@10 for this sample: 1/1 = 1.0
+
+# Generated answer:
+gen_answer = "NKG2D is an activating receptor expressed on NK cells that recognizes stress-induced ligands MICA and MICB on infected or tumor cells [1], triggering cytotoxic responses including perforin-mediated killing [2]."
+
+# Reference answer:
+ref_answer = "NKG2D is an activating receptor on NK cells that binds stress ligands such as MICA and MICB..."
+
+# ROUGE-L for this sample: 0.52  (good phrase overlap)
+# BERTScore F1 for this sample: 0.93  (high semantic similarity)
+```
+
+**Aggregate metrics dict (returned by evaluate.py):**
+```python
+metrics = {
+    # Retrieval
+    "recall_at_1": 0.559,
+    "recall_at_3": 0.693,
+    "recall_at_5": 0.751,
+    "recall_at_10": 0.751,    # = recall@5 since rerank_topk=5
+    "mrr_at_10": 0.613,
+
+    # Generation
+    "rouge_l": 0.398,
+    "bertscore_f1": 0.907,
+    "bertscore_precision": 0.901,
+    "bertscore_recall": 0.914,
+
+    # Per doc_type breakdown
+    "by_doc_type": {
+        "textbook": {"rouge_l": 0.398, "bertscore_f1": 0.907, "count": 116}
+    },
+
+    # Latency (average over 116 queries)
+    "avg_latency_ms": {
+        "retrieval": 45,
+        "merge": 11,
+        "rerank": 308,
+        "llm": 1872
+    },
+
+    # Sample count
+    "n_samples": 116
+}
+```
+
+**HTML report structure:**
+```
+outputs/system_eval/
+  ├── evaluation_report.html     # self-contained report (all charts embedded as base64)
+  ├── retrieval_recall.png       # chart 1: Recall@K line + MRR dashed
+  ├── reranker_precision.png     # chart 2: grouped bar before/after
+  ├── generation_quality.png     # chart 3: ROUGE-L + BERTScore by doc_type
+  ├── e2e_radar.png              # chart 4: radar across 7 normalized metrics
+  ├── latency_breakdown.png      # chart 5: stacked horizontal bar
+  └── llm_comparison.png         # chart 6: only if --compare-llm used
+```
+
+**LLM comparison output sample:**
+```python
+# _request_chat_url() called for fine-tuned model (port 8001):
+ft_answer = "NKG2D is an activating receptor on NK cells that recognizes MICA and MICB stress ligands upregulated on infected cells [1]. This recognition triggers perforin and granzyme B release, directly killing the target cell [2]."
+
+# Scores:
+base_rouge    = 0.38   # pretrained model
+ft_rouge      = 0.47   # fine-tuned model  (+0.09 ✅)
+base_bert_f1  = 0.899
+ft_bert_f1    = 0.921  # (+0.022 ✅)
+
+# Aggregate across 116 samples:
+{
+  "pretrained":  {"rouge_l": 0.381, "bertscore_f1": 0.899},
+  "finetuned":   {"rouge_l": 0.398, "bertscore_f1": 0.907},
+  "delta":       {"rouge_l": +0.017, "bertscore_f1": +0.008}
+}
+```
+
 ---
 
 ## 17. Streamlit UI
@@ -1675,6 +2634,70 @@ Color palette:
 The antibody Y-shape SVG (IgG immunoglobulin) serves as the brand icon — rendered as
 inline SVG in the hero banner and sidebar.
 
+### 📥📤 Data Structures & I/O Examples
+
+**`st.session_state` — what's stored across requests:**
+```python
+# After first query in the Q&A page:
+st.session_state = {
+    "pipeline": <RAGPipeline object>,          # loaded once, reused
+    "messages": [                               # chat history for display
+        {
+            "role": "user",
+            "content": "What cytokines do Th2 cells secrete?"
+        },
+        {
+            "role": "assistant",
+            "content": "Th2 cells secrete IL-4, IL-5, and IL-13 [1]...",
+            "cite_pages": [284, 291, 280],
+            "cite_chapters": ["Chapter 9", ...],
+            "related_images": [{"title": "Figure 9.3", "path": "..."}],
+            "latency_ms": {"retrieval": 48, "rerank": 318, "llm": 1854}
+        }
+    ]
+}
+
+# After Settings page "Apply":
+del st.session_state["pipeline"]   # force reinit with new config
+# Next query call: pipeline is recreated with new bm25_topk, temperature, etc.
+```
+
+**Q&A page rendering — what each result field maps to in the UI:**
+```python
+result = pipeline.answer(query)
+
+# result["answer"]         → displayed in chat bubble with markdown rendering
+# result["cite_pages"]     → "Sources: p.284, p.291, p.280" footer under answer
+# result["cite_chapters"]  → "Chapter 9" labels on source chips
+# result["related_images"] → expandable "Related Figures" section with image previews
+# result["latency_ms"]     → animated bar chart: retrieval=48ms, rerank=318ms, llm=1854ms
+
+# Example rendering:
+st.markdown(result["answer"])
+# → "Th2 cells secrete three primary cytokines: **IL-4**, **IL-5**, and **IL-13** [1]..."
+
+for img in result["related_images"]:
+    st.image(img["path"], caption=img["title"])
+# → displays Figure 9.3 thumbnail with caption
+```
+
+**Documents page — index stats display:**
+```python
+# MongoDB query for stats:
+stats = {
+    "total_chunks": collection.count_documents({}),   # → 8,494 (parents + children)
+    "child_chunks": collection.count_documents({"metadata.is_parent": False}),  # → 4,247
+    "parent_chunks": collection.count_documents({"metadata.is_parent": True}),  # → 4,247
+    "sources": collection.distinct("metadata.source_file"),  # → ["JanewaysImmunobiologyBiology10thEdition.pdf"]
+    "chroma_vectors": chroma_collection.count(),      # → 4,247
+}
+
+# Displayed as metric cards in the UI:
+# 📚 Total Chunks: 8,494
+# 🔍 Vector Index: 4,247 embeddings
+# 📄 Sources: 1 document
+```
+
 ---
 
 ## 18. End-to-End Data Flow
@@ -1723,6 +2746,71 @@ OUTPUT: {
   "latency_ms":     {"retrieval": 45, "rerank": 312, "llm": 1820},
   "retrieved_docs": [Document(...), ...]
 }
+```
+
+### 📥📤 Data Structures & I/O Examples
+
+**Complete type trace for `"What cytokines do Th2 cells secrete?"`:**
+
+```python
+# ─── INPUT ───────────────────────────────────────────────────────
+query: str = "What cytokines do Th2 cells secrete?"
+
+# ─── STEP 1: BM25 ─────────────────────────────────────────────────
+query_tokens: list[str] = ["cytokines", "th2", "cells", "secrete"]
+bm25_scores: np.ndarray shape=(4247,)  dtype=float64
+# top-10 indices selected, returned as:
+bm25_results: list[Document]  len=10
+
+# ─── STEP 2: DENSE ────────────────────────────────────────────────
+query_vector: np.ndarray shape=(1024,)  dtype=float32
+# Chroma cosine ANN search, returned as:
+dense_results: list[Document]  len=10
+
+# ─── STEP 3: RRF ──────────────────────────────────────────────────
+fused: list[tuple[str, float]]  len≤20  # (unique_id, rrf_score)
+# e.g. [("uid_A", 0.01626), ("uid_C", 0.01614), ...]
+
+# ─── STEP 4: merge_docs ───────────────────────────────────────────
+# Input:  20 child Documents  (avg 65 words each)
+# MongoDB lookups: 20 parent_id queries
+# Output: ≤20 parent Documents  (avg 220 words each, deduplicated)
+merged: list[Document]  len≤20
+
+# ─── STEP 5: RERANKER ─────────────────────────────────────────────
+# Input: query (str) + merged (list[Document] len≤20)
+# Tokenize 20 pairs → tensor shape (20, 512)
+# Forward pass → logits tensor shape (20,)
+# Sort, keep top 5
+reranked: list[Document]  len=5
+
+# ─── STEP 6: FORMAT CONTEXT ───────────────────────────────────────
+context: str  # numbered passages
+# "[1] Th2 cells produce IL-4, IL-5...\n\n[2] B cell class switching...\n\n..."
+# ~700 tokens total
+
+# ─── STEP 7: LLM ──────────────────────────────────────────────────
+messages: list[dict]  len=2  # system + user (no history on first turn)
+# vLLM API call, ~1.8 seconds
+answer_text: str  # ~200 tokens
+
+# ─── STEP 8: POST-PROCESSING ──────────────────────────────────────
+result: dict = {
+    "answer":         str,           # ~200 words
+    "cite_pages":     list[int],     # len=2-3
+    "cite_sources":   list[str],     # len=2-3
+    "cite_chapters":  list[str],     # len=2-3
+    "related_images": list[dict],    # len=0-2 depending on nearby figures
+    "latency_ms":     dict,          # 4 keys: retrieval, merge, rerank, llm
+    "retrieved_docs": list[Document] # len=5
+}
+
+# ─── TOTAL LATENCY ────────────────────────────────────────────────
+# retrieval: ~48 ms
+# merge:     ~12 ms
+# rerank:    ~318 ms
+# llm:       ~1854 ms
+# TOTAL:     ~2.2 seconds end-to-end (GPU-accelerated reranker + vLLM)
 ```
 
 ---
