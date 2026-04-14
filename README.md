@@ -38,15 +38,23 @@ ImmunoBiology RAG is a production-ready **Retrieval-Augmented Generation** syste
 
 The system is fully fine-tunable: it ships with a complete training pipeline to adapt both the reranker and the LLM to the immunology domain using synthetically generated QA data.
 
-### Key Results (after fine-tuning on Janeway's Immunobiology 10e)
+### Measured Results — Janeway's Immunobiology 10e (A100-40GB)
+
+**Knowledge base:** 1 textbook · 4,247 chunks · 2,157 pages · 16,936 synthetic QA pairs
 
 | Metric | Score | What it means |
 |--------|-------|---------------|
-| Recall@1 | **0.69** | The correct passage is the #1 retrieval result 69% of the time |
-| Recall@5 | **0.79** | The correct passage appears in the top 5 results 79% of the time |
-| MRR@10 | **0.775** | Average reciprocal rank of the first correct result |
-| ROUGE-L | **0.55** | Generated answers share 55% key phrase overlap with reference answers |
-| BERTScore F1 | **0.93** | Generated answers are semantically equivalent to reference 93% of the time |
+| Recall@1 | **0.559** | The correct passage is the #1 retrieval result 55.9% of the time |
+| Recall@3 | **0.693** | The correct passage appears in the top 3 results 69.3% of the time |
+| Recall@5 | **0.751** | The correct passage appears in the top 5 results 75.1% of the time |
+| MRR@10 | **0.613** | Average reciprocal rank of the first correct passage |
+| ROUGE-L | **0.398** | Generated answers share ~40% key phrase overlap with reference answers |
+| BERTScore F1 | **0.907** | Generated answers are semantically equivalent to reference ~91% of the time |
+
+> Retrieval and generation metrics use the **base reranker** (`BAAI/bge-reranker-v2-m3`).
+> The reranker fine-tuning pipeline (LoRA, v1–v4) is included and documented — see
+> [Fine-Tuning](#fine-tuning) and [`docs/autodl_runbook.md`](docs/autodl_runbook.md)
+> for the full experimental history and ongoing v4 parent-chunk fix.
 
 ---
 
@@ -74,9 +82,9 @@ User query
 
 | Layer | Component | Notes |
 |-------|-----------|-------|
-| **LLM** | Qwen/Qwen3-8B | Served via vLLM; LoRA fine-tuned on immunology QA |
+| **LLM** | Qwen/Qwen3-8B | Served via vLLM; LoRA SFT on 16,936 immunology QA pairs (~4.6 h) |
 | **Embedding** | BAAI/bge-m3 | 1024-dim dense vectors; top MTEB English |
-| **Reranker** | BAAI/bge-reranker-v2-m3 | Cross-encoder; fine-tuned on immunology triplets |
+| **Reranker** | BAAI/bge-reranker-v2-m3 | Cross-encoder; LoRA fine-tuning pipeline included (v1–v4) |
 | **Sparse retrieval** | BM25 (rank-bm25) | English tokenization via NLTK |
 | **Vector store** | ChromaDB | Persistent; FAISS fallback available |
 | **Metadata store** | MongoDB | Parent-child chunks, figure references |
@@ -241,41 +249,69 @@ Open `http://localhost:6006` — go to the **Q&A** page and ask a question.
 
 ## Fine-Tuning
 
-The system includes a complete training pipeline to adapt the reranker and LLM to your
-specific document collection.
+The system ships with a complete training pipeline to adapt both the reranker and LLM to
+your document collection. All timings are measured on an **NVIDIA A100-40GB**.
 
-> ⚠️ **GPU conflict:** vLLM must be killed before training (`pkill -f vllm; sleep 5`).
-> Fine-tuning and vLLM cannot run simultaneously on a 40 GB GPU.
+> ⚠️ **GPU conflict:** vLLM must be killed before any training step (`pkill -f vllm; sleep 5`).
+> Fine-tuning and vLLM cannot share a 40 GB GPU.
 
-### Step 1 — Generate Training Data (requires vLLM running)
+### Step 1 — Generate Training Data
+
+Stage 1 (QA generation) requires vLLM running. Stages 2–4 are CPU-only and fast.
 
 ```bash
 python -m train.build_train_data --workers 4
-# Outputs: data/train/reranker_train.jsonl, sft_train.jsonl, eval_qa.jsonl
 ```
 
-### Step 2 — Fine-Tune Reranker (~1-2 hrs on A100)
+| Stage | Output | Time | Requires |
+|-------|--------|------|----------|
+| 1 — QA generation | `data/train/qa_pairs_cache.jsonl` (16,936 pairs) | ~3–4 h | vLLM |
+| 2 — Reranker triplets | `reranker_train.jsonl` + `reranker_test.jsonl` | < 10 min | BM25 + ChromaDB |
+| 3 — SFT data | `data/train/sft_train.jsonl` | < 1 min | — |
+| 4 — Eval QA set | `data/train/eval_qa.jsonl` (116 pairs) | < 1 min | — |
+
+Each stage checkpoints its output and is skipped automatically on re-run. Use `--force`
+to regenerate from scratch.
+
+### Step 2 — Fine-Tune Reranker (~2 h on A100 with LoRA)
+
+Uses LoRA (PEFT) to adapt `bge-reranker-v2-m3` without catastrophic forgetting.
+Requires `pip install peft` once.
 
 ```bash
-pkill -f vllm; sleep 5            # free GPU first
-python -m train.train_reranker
-# Output: outputs/models/reranker_finetuned/best/
+pip install peft
+pkill -f vllm; sleep 5                       # free GPU first
+TRANSFORMERS_OFFLINE=1 python -m train.train_reranker --lora
+# Output: outputs/models/reranker_finetuned/best/adapter_config.json (~30-50 MB adapter)
 ```
 
-### Step 3 — Fine-Tune LLM (~30 min on A100)
+> **LoRA vs full fine-tuning:** Full fine-tuning (~4.7 h) caused catastrophic forgetting
+> (Recall@1 dropped from 0.559 → 0.426). LoRA freezes the base weights and trains only
+> ~7 M of 560 M parameters (~1.3%), preserving general ranking knowledge.
+> See [`docs/autodl_runbook.md`](docs/autodl_runbook.md) for the full v1–v4 experimental log.
 
-Requires LLaMA-Factory:
+After training, activate it in `config.yaml`:
+```yaml
+models:
+  reranker_use_finetuned: true
+```
+
+### Step 3 — Fine-Tune LLM (~4.6 h on A100)
+
+3 epochs over 16,936 QA pairs (6,351 steps). Requires LLaMA-Factory:
+
 ```bash
 git clone https://github.com/hiyouga/LLaMA-Factory.git LLaMA-Factory
 cd LLaMA-Factory && pip install -e ".[torch,metrics]" && cd ..
 
+pkill -f vllm; sleep 5
 python -m train.train_llm_sft
-# Output: outputs/models/llm_finetuned/checkpoint-N/
+# Output: outputs/models/llm_finetuned/checkpoint-6351/
 ```
 
-### Step 4 — Merge LoRA Adapter
+### Step 4 — Merge LoRA Adapter into Base Model
 
-vLLM cannot serve a raw LoRA adapter — merge it into the base model first:
+vLLM requires a complete standalone model directory — merge the adapter first:
 
 ```bash
 CKPT=$(ls -d outputs/models/llm_finetuned/checkpoint-* | sort -V | tail -1)
@@ -290,6 +326,9 @@ llamafactory-cli export \
     --export_legacy_format false
 ```
 
+> The reranker LoRA adapter does **not** need merging — it is loaded directly at runtime
+> via `PeftModel.from_pretrained()`. Only the LLM adapter requires merging for vLLM.
+
 ### Step 5 — Restart vLLM with Fine-Tuned Model
 
 ```bash
@@ -299,6 +338,7 @@ python -m vllm.entrypoints.openai.api_server \
     --served-model-name Qwen/Qwen3-8B \
     --dtype bfloat16 --max-model-len 8192 \
     --gpu-memory-utilization 0.85 --enable-prefix-caching --port 8000 &
+sleep 60 && curl http://localhost:8000/v1/models
 ```
 
 ---
@@ -306,19 +346,30 @@ python -m vllm.entrypoints.openai.api_server \
 ## Evaluation
 
 ```bash
-# Full evaluation (~15-30 min)
+# Full evaluation (~15-30 min, 150 QA pairs)
 python evaluate.py
 
 # Quick evaluation (20 random pairs, ~3 min)
 python evaluate.py --quick
+
+# Compare pretrained vs fine-tuned LLM generation quality
+# Requires two vLLM servers: base on port 8000, fine-tuned on port 8001
+python evaluate.py --compare-llm \
+    --finetuned-llm-url http://localhost:8001/v1 \
+    --finetuned-llm-model finetuned
 ```
 
 Outputs saved to `outputs/system_eval/`:
-- `evaluation_report.html` — full self-contained HTML report
-- `retrieval_recall.png` — Recall@K line chart
-- `generation_quality.png` — ROUGE-L and BERTScore grouped bar chart
-- `latency_breakdown.png` — per-module latency
-- `metrics.json` — all numeric results
+
+| File | Description |
+|------|-------------|
+| `evaluation_report.html` | Self-contained HTML report with all charts embedded |
+| `retrieval_recall.png` | Recall@1/@3/@5/@10 line chart + MRR@10 reference line |
+| `reranker_precision.png` | Before vs after reranking: Precision@1 and NDCG@5 |
+| `generation_quality.png` | ROUGE-L and BERTScore-F1 by document type |
+| `e2e_radar.png` | 7-axis end-to-end radar chart |
+| `latency_breakdown.png` | Per-module latency (BM25 / dense / RRF / merge / rerank / LLM) |
+| `llm_comparison.png` | Pretrained vs fine-tuned LLM bar chart *(with `--compare-llm` only)* |
 
 ---
 
@@ -430,8 +481,12 @@ Changes take effect immediately in the Streamlit **Settings** page without resta
 | `Connection refused: 6000` | Semantic chunking service not running |
 | `404 — model Qwen/Qwen3-8B does not exist` | Add `--served-model-name Qwen/Qwen3-8B` to vLLM command |
 | `CUDA out of memory` during training | Kill vLLM first: `pkill -f vllm; sleep 5` |
+| `CUDA out of memory` during `evaluate.py` | Already fixed in `bge_m3_reranker.py` (`del inputs; torch.cuda.empty_cache()`). If it persists: `PYTORCH_ALLOC_CONF=expandable_segments:True python evaluate.py` |
 | `400 context length exceeded` | Set `max_tokens: 1024` in config.yaml |
 | `MaxRetryError: huggingface.co timed out` | Set `export HF_ENDPOINT=https://hf-mirror.com` |
+| `train_reranker.py` hangs silently | Add `TRANSFORMERS_OFFLINE=1` prefix — HF Hub is blocked on AutoDL |
+| Reranker loss collapses to `0.0000` at step 100 | Hard negatives are LLM-generated text — delete Stage 2 files and re-run `build_train_data.py` |
+| Fine-tuned reranker worse than base model | See runbook §4.7b–d — three root causes identified (distribution mismatch → catastrophic forgetting → parent/child chunk mismatch) |
 | MongoDB `child process failed` | `rm -f /data/db/mongod.lock` then restart |
 
 See [`docs/autodl_runbook.md`](docs/autodl_runbook.md) for the complete troubleshooting guide.
